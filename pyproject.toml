@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-rag-pipeline"
+version = "0.1.0"
+description = "Pipeline RAG para PDFs com S3, OpenAI e pgvector."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3",
+    "easyocr",
+    "httpx",
+    "numpy",
+    "openai",
+    "Pillow",
+    "psycopg[binary]",
+    "PyMuPDF",
+]
+
+[project.scripts]
+pdf-rag = "pdf_rag:main"
+
+[tool.setuptools.packages.find]
+include = ["pdf_rag"]

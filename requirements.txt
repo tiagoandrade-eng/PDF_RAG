@@ -1,0 +1,8 @@
+boto3
+PyMuPDF
+httpx
+openai
+Pillow
+psycopg[binary]
+numpy
+easyocr
