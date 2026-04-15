@@ -35,8 +35,6 @@ Pipeline de ingestao RAG para PDFs com suporte a:
 ## Execucao rapida
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python .\run_pdf_rag.py
 ```
@@ -44,8 +42,6 @@ python .\run_pdf_rag.py
 ## Instalacao como projeto
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -e .
 pdf-rag
 ```

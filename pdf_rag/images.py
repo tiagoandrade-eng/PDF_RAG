@@ -259,6 +259,9 @@ def _init_easyocr_worker(langs: list[str]) -> None:
     _easyocr_reader = easyocr.Reader(langs, gpu=False, verbose=False)
 
 
+OCR_MAX_SIDE = 1200
+
+
 def easyocr_worker(payload: dict) -> dict:
     import numpy as np
 
@@ -268,7 +271,12 @@ def easyocr_worker(payload: dict) -> dict:
             import easyocr
 
             reader = easyocr.Reader(payload.get("langs", ["pt", "en"]), gpu=False, verbose=False)
-        img_arr = np.array(Image.open(BytesIO(payload["img_bytes"])).convert("RGB"))
+        img = Image.open(BytesIO(payload["img_bytes"])).convert("RGB")
+        maior_lado = max(img.width, img.height)
+        if maior_lado > OCR_MAX_SIDE:
+            scale = OCR_MAX_SIDE / maior_lado
+            img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
+        img_arr = np.array(img)
         results = reader.readtext(img_arr, detail=1, paragraph=False)
         texto = " ".join(r[1] for r in results if r[2] >= 0.3).strip()
     except Exception as exc:
