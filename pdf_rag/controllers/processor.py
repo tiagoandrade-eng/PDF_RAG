@@ -4,24 +4,207 @@ import asyncio
 import logging
 import os
 import tempfile
+from collections import Counter
 
 import boto3
 import fitz
+from openai import AsyncOpenAI
 
-from .analysis_service import AnalysisService
-from .config import BATCH_SIZES, TAMANHO_QUEBRA_SIZES, Config
-from .database import DatabaseManager
-from .embeddings import EmbeddingClient, truncar
-from .image_pipeline import ImageContentPipeline, ImageSerializer
-from .ocr_service import OCRService
-from .text_pipeline import limpar_texto_pagina, serializar_texto_pagina
-from .tokens import TokenCounter
-from .vision import VisionClient
+from ..models.config import Config, TokenCounter, truncar
+from ..models.constants import (
+    BATCH_SIZES,
+    MAX_CHARS,
+    MODEL_FULL,
+    MODEL_MINI,
+    TAMANHO_QUEBRA_SIZES,
+)
+from ..models.database import DatabaseManager
+from .images import (
+    ImageContentPipeline,
+    ImageSerializer,
+    OCRService,
+    VisionClient,
+    escolher_modelo,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+class EmbeddingClient:
+    MODEL = "text-embedding-3-large"
+
+    def __init__(self, api_key: str, counter: TokenCounter) -> None:
+        self._client = AsyncOpenAI(api_key=api_key)
+        self._counter = counter
+
+    async def embed(self, texts: list[str], max_retries: int = 3) -> list[list[float]]:
+        for attempt in range(max_retries):
+            try:
+                resp = await self._client.embeddings.create(input=texts, model=self.MODEL)
+                if resp.usage:
+                    self._counter.add(self.MODEL, resp.usage.total_tokens)
+                return [item.embedding for item in resp.data]
+            except Exception as exc:
+                if attempt < max_retries - 1:
+                    wait = 2**attempt
+                    logger.warning(
+                        "Embedding erro (tentativa %s): %s. Aguardando %ss...",
+                        attempt + 1, exc, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
+
+# ---------------------------------------------------------------------------
+# Text pipeline
+# ---------------------------------------------------------------------------
+def limpar_texto_pagina(texto: str) -> str:
+    return texto.strip().replace("\x00", "")
+
+
+def quebrar_texto_em_chunks(texto: str, max_chars: int = MAX_CHARS) -> list[str]:
+    return [texto[i : i + max_chars] for i in range(0, len(texto), max_chars)]
+
+
+def criar_metadata_texto(page_num: int, arquivo: str, chunk_index: int | str) -> dict:
+    return {
+        "pagina": page_num,
+        "arquivo": arquivo,
+        "chunk_index": chunk_index,
+        "tipo": "texto",
+    }
+
+
+def serializar_texto_pagina(
+    page_num: int,
+    arquivo: str,
+    texto: str,
+    ja_processados: set[tuple[str, str]],
+) -> tuple[list[str], list[dict], int]:
+    if not texto:
+        logger.info("Pag %s: sem texto extraivel.", page_num)
+        return [], [], 0
+
+    chunks = quebrar_texto_em_chunks(texto)
+    logger.info("Pag %s: %s chars -> %s chunk(s)", page_num, len(texto), len(chunks))
+
+    texts: list[str] = []
+    metas: list[dict] = []
+    pulados = 0
+
+    for idx, chunk in enumerate(chunks):
+        if (str(page_num), str(idx)) in ja_processados:
+            pulados += 1
+            continue
+        texts.append(chunk)
+        metas.append(criar_metadata_texto(page_num, arquivo, idx))
+
+    return texts, metas, pulados
+
+
+# ---------------------------------------------------------------------------
+# Analysis service (modo analise)
+# ---------------------------------------------------------------------------
+class AnalysisService:
+    def __init__(self, cfg: Config, image_serializer: ImageSerializer, ocr_service: OCRService) -> None:
+        self.cfg = cfg
+        self.image_serializer = image_serializer
+        self.ocr_service = ocr_service
+
+    async def analisar_pdf(self, s3_key: str, pdf_path: str) -> dict:
+        doc = fitz.open(pdf_path)
+        stats: Counter[str] = Counter()
+        payloads: list[dict] = []
+
+        try:
+            total_pags = len(doc)
+            logger.info(
+                "Analise PDF: %s paginas | processar_imagens=%s | ocr_workers=%s",
+                total_pags, self.cfg.processar_imagens, self.cfg.ocr_workers,
+            )
+
+            for num in range(total_pags):
+                pag = doc[num]
+                page_num = num + 1
+                texto = limpar_texto_pagina(pag.get_text())
+                stats["pages_total"] += 1
+                stats["text_chars_total"] += len(texto)
+                if texto:
+                    stats["pages_with_text"] += 1
+                else:
+                    stats["pages_without_text"] += 1
+
+                imagens_pagina = pag.get_images(full=True)
+                stats["image_occurrences_total"] += len(imagens_pagina)
+
+                if self.cfg.processar_imagens:
+                    payloads.extend(self.image_serializer.serializar_paginas([(page_num, pag, texto)], set(), stats))
+
+            stats["images_to_ocr"] = len(payloads)
+            ocr_results = await self.ocr_service.executar(payloads)
+            aceitos = [payload for payload in ocr_results if payload["chars_uteis"] >= self.cfg.ocr_min_chars]
+            vision_needed = [payload for payload in ocr_results if payload["chars_uteis"] < self.cfg.ocr_min_chars]
+            mini_count = sum(
+                1 for payload in vision_needed if escolher_modelo(payload["width"], payload["height"]) == MODEL_MINI
+            )
+
+            resultado = {
+                "status": "analysis",
+                "arquivo": s3_key,
+                "pages_total": stats["pages_total"],
+                "pages_with_text": stats["pages_with_text"],
+                "pages_without_text": stats["pages_without_text"],
+                "avg_text_chars_per_page": round(
+                    stats["text_chars_total"] / max(stats["pages_total"], 1), 1,
+                ),
+                "image_occurrences_total": stats["image_occurrences_total"],
+                "unique_xrefs_seen": stats["unique_xrefs_seen"],
+                "duplicate_xrefs_skipped": stats["duplicate_xrefs_skipped"],
+                "images_filtered_total": stats["images_filtered_total"],
+                "images_filtered_by_reason": {
+                    chave.removeprefix("filtered_reason__"): valor
+                    for chave, valor in sorted(stats.items())
+                    if chave.startswith("filtered_reason__")
+                },
+                "scan_pages_rendered": stats["scan_pages_rendered"],
+                "images_to_ocr": stats["images_to_ocr"],
+                "ocr_accepted": len(aceitos),
+                "vision_needed": len(vision_needed),
+                "vision_model_split": {
+                    MODEL_MINI: mini_count,
+                    MODEL_FULL: len(vision_needed) - mini_count,
+                },
+                "ocr_min_chars": self.cfg.ocr_min_chars,
+                "filters": {
+                    "min_image_area": self.cfg.min_image_area,
+                    "min_image_side": self.cfg.min_image_side,
+                    "max_aspect_ratio": self.cfg.max_aspect_ratio,
+                },
+            }
+            logger.info(
+                "\n%s\nAnalise concluida\n   Paginas         : %s\n   Ocorrencias img : %s\n"
+                "   Xrefs unicos    : %s\n   Duplicadas skip : %s\n   Filtradas       : %s\n"
+                "   Para OCR        : %s\n   OCR ok          : %s\n   Iria para Vision: %s\n%s",
+                "=" * 50,
+                resultado["pages_total"], resultado["image_occurrences_total"],
+                resultado["unique_xrefs_seen"], resultado["duplicate_xrefs_skipped"],
+                resultado["images_filtered_total"], resultado["images_to_ocr"],
+                resultado["ocr_accepted"], resultado["vision_needed"],
+                "=" * 50,
+            )
+            return resultado
+        finally:
+            doc.close()
+
+
+# ---------------------------------------------------------------------------
+# PDF Processor (orquestrador principal)
+# ---------------------------------------------------------------------------
 class PDFProcessor:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -63,7 +246,7 @@ class PDFProcessor:
             self._remover_temp(tmp_path)
 
     def _inicializar_clientes_processamento(self) -> None:
-        self.db = DatabaseManager(self.cfg.rds_db_url, self.cfg.schema)
+        self.db = DatabaseManager(self.cfg.rds_db_url, self.cfg.db_schema)
         self.embedder = EmbeddingClient(self.cfg.openai_api_key, self.counter)
         self.vision = VisionClient(self.cfg.openai_api_key, self.counter, self.cfg.vision_concurrency)
 
@@ -104,11 +287,7 @@ class PDFProcessor:
             total_pags = len(doc)
             logger.info(
                 "PDF: %s paginas | schema='%s' | tabela='%s' | batch=%s | ocr_workers=%s",
-                total_pags,
-                self.cfg.schema,
-                tabela,
-                self.cfg.page_batch_size,
-                self.cfg.ocr_workers,
+                total_pags, self.cfg.db_schema, tabela, self.cfg.page_batch_size, self.cfg.ocr_workers,
             )
 
             chunks_texto = 0
@@ -129,10 +308,7 @@ class PDFProcessor:
                     texto = limpar_texto_pagina(pag.get_text())
 
                     textos_pagina, metas_pagina, pulados_pagina = serializar_texto_pagina(
-                        page_num,
-                        s3_key,
-                        texto,
-                        ja_processados,
+                        page_num, s3_key, texto, ja_processados,
                     )
                     chunks_pulados += pulados_pagina
 
@@ -161,7 +337,7 @@ class PDFProcessor:
             }
             resultado = {
                 "status": "ok",
-                "schema": self.cfg.schema,
+                "schema": self.cfg.db_schema,
                 "tabela": tabela,
                 "chunks_texto": chunks_texto,
                 "chunks_imagem": chunks_img,
@@ -172,14 +348,8 @@ class PDFProcessor:
             logger.info(
                 "\n%s\nConcluido!\n   Schema : %s\n   Tabela : %s\n   Texto  : %s chunks inseridos\n"
                 "   Imagens: %s chunks inseridos\n   Pulados: %s (ja existiam)\n%s\n%s",
-                "=" * 50,
-                self.cfg.schema,
-                tabela,
-                chunks_texto,
-                chunks_img,
-                chunks_pulados,
-                self.counter.resumo(),
-                "=" * 50,
+                "=" * 50, self.cfg.db_schema, tabela, chunks_texto, chunks_img,
+                chunks_pulados, self.counter.resumo(), "=" * 50,
             )
             return resultado
         finally:
@@ -188,21 +358,15 @@ class PDFProcessor:
     async def _flush(self, tabela: str, texts: list[str], metas: list[dict]) -> int:
         if not texts:
             return 0
-
         for batch_size in BATCH_SIZES:
             try:
                 return await self._flush_em_blocos(tabela, texts, metas, batch_size)
             except Exception as exc:
                 logger.warning("Flush falhou com batch_size=%s: %s", batch_size, exc)
-
         return await self._flush_com_quebra(tabela, texts, metas)
 
     async def _flush_em_blocos(
-        self,
-        tabela: str,
-        texts: list[str],
-        metas: list[dict],
-        batch_size: int,
+        self, tabela: str, texts: list[str], metas: list[dict], batch_size: int,
     ) -> int:
         db, embedder, _ = self._require_processing_clients()
         total = 0
@@ -225,8 +389,7 @@ class PDFProcessor:
             try:
                 vetores = await embedder.embed([texto])
                 total += await asyncio.to_thread(
-                    db.insert_records,
-                    tabela,
+                    db.insert_records, tabela,
                     [{"text": texto, "metadata": meta, "embedding": vetores[0]}],
                 )
             except Exception as exc:

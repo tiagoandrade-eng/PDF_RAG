@@ -6,3 +6,6 @@ Pillow
 psycopg[binary]
 numpy
 easyocr
+pydantic
+fastapi
+uvicorn

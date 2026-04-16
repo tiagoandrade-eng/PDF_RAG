@@ -4,23 +4,13 @@ import asyncio
 import json
 import sys
 
-from .config import (
-    DEFAULT_SCHEMA,
-    MAX_ASPECT_RATIO,
-    MIN_IMAGE_AREA,
-    MIN_IMAGE_SIDE,
-    OCR_MIN_CHARS,
-    OCR_WORKERS_DEFAULT,
-    PAGE_BATCH_SIZE,
-    VISION_CONCURRENCY,
+from ..models.config import (
     Config,
     carregar_config_execucao,
     configure_logging,
     ler_bool_config,
-    ler_float_config,
-    ler_int_config,
 )
-from .processor import PDFProcessor
+from ..controllers.processor import PDFProcessor
 
 
 async def processar_documento_async(s3_pdf_key: str, tabela: str, config: Config) -> dict:
@@ -49,15 +39,15 @@ def processar_documento_api(
     aws_secret_access_key: str,
     aws_region: str,
     aws_bucket_name: str,
-    schema: str = DEFAULT_SCHEMA,
+    schema: str = "public",
     processar_imagens: bool = True,
-    page_batch_size: int = PAGE_BATCH_SIZE,
-    ocr_workers: int = OCR_WORKERS_DEFAULT,
-    vision_concurrency: int = VISION_CONCURRENCY,
-    min_image_area: int = MIN_IMAGE_AREA,
-    min_image_side: int = MIN_IMAGE_SIDE,
-    max_aspect_ratio: float = MAX_ASPECT_RATIO,
-    ocr_min_chars: int = OCR_MIN_CHARS,
+    page_batch_size: int = 100,
+    ocr_workers: int = 4,
+    vision_concurrency: int = 6,
+    min_image_area: int = 10_000,
+    min_image_side: int = 80,
+    max_aspect_ratio: float = 8.0,
+    ocr_min_chars: int = 60,
 ) -> dict:
     """
     Ponto de entrada sincrono.
@@ -72,7 +62,7 @@ def processar_documento_api(
         aws_secret_access_key=aws_secret_access_key,
         aws_region=aws_region,
         aws_bucket_name=aws_bucket_name,
-        schema=schema,
+        db_schema=schema,
         processar_imagens=processar_imagens,
         page_batch_size=page_batch_size,
         ocr_workers=ocr_workers,
@@ -91,15 +81,15 @@ def analisar_documento_api(
     aws_secret_access_key: str,
     aws_region: str,
     aws_bucket_name: str,
-    schema: str = DEFAULT_SCHEMA,
+    schema: str = "public",
     processar_imagens: bool = True,
-    page_batch_size: int = PAGE_BATCH_SIZE,
-    ocr_workers: int = OCR_WORKERS_DEFAULT,
-    vision_concurrency: int = VISION_CONCURRENCY,
-    min_image_area: int = MIN_IMAGE_AREA,
-    min_image_side: int = MIN_IMAGE_SIDE,
-    max_aspect_ratio: float = MAX_ASPECT_RATIO,
-    ocr_min_chars: int = OCR_MIN_CHARS,
+    page_batch_size: int = 100,
+    ocr_workers: int = 4,
+    vision_concurrency: int = 6,
+    min_image_area: int = 10_000,
+    min_image_side: int = 80,
+    max_aspect_ratio: float = 8.0,
+    ocr_min_chars: int = 60,
 ) -> dict:
     configure_logging()
     cfg = Config(
@@ -109,7 +99,7 @@ def analisar_documento_api(
         aws_secret_access_key=aws_secret_access_key,
         aws_region=aws_region,
         aws_bucket_name=aws_bucket_name,
-        schema=schema,
+        db_schema=schema,
         processar_imagens=processar_imagens,
         page_batch_size=page_batch_size,
         ocr_workers=ocr_workers,
@@ -127,23 +117,23 @@ def main() -> int:
     configure_logging()
     try:
         runtime = carregar_config_execucao()
-        modo_analise = ler_bool_config(runtime.get("MODO_ANALISE"), False)
         common_kwargs = {
             "s3_pdf_key": runtime.get("S3_PDF_KEY", "suporte/seu_arquivo.pdf"),
-            "schema": runtime.get("DB_SCHEMA", DEFAULT_SCHEMA),
-            "processar_imagens": ler_bool_config(runtime.get("PROCESSAR_IMAGENS"), True),
-            "page_batch_size": ler_int_config(runtime.get("PAGE_BATCH_SIZE"), PAGE_BATCH_SIZE),
-            "ocr_workers": ler_int_config(runtime.get("OCR_WORKERS"), OCR_WORKERS_DEFAULT),
-            "vision_concurrency": ler_int_config(runtime.get("VISION_CONCURRENCY"), VISION_CONCURRENCY),
-            "min_image_area": ler_int_config(runtime.get("MIN_IMAGE_AREA"), MIN_IMAGE_AREA),
-            "min_image_side": ler_int_config(runtime.get("MIN_IMAGE_SIDE"), MIN_IMAGE_SIDE),
-            "max_aspect_ratio": ler_float_config(runtime.get("MAX_ASPECT_RATIO"), MAX_ASPECT_RATIO),
-            "ocr_min_chars": ler_int_config(runtime.get("OCR_MIN_CHARS"), OCR_MIN_CHARS),
+            "schema": runtime.get("DB_SCHEMA", "public"),
+            "processar_imagens": True,
+            "page_batch_size": 100,
+            "ocr_workers": 4,
+            "vision_concurrency": 6,
+            "ocr_min_chars": 60,
+            "min_image_area": 10_000,
+            "min_image_side": 80,
+            "max_aspect_ratio": 8.0,
             "aws_access_key_id": runtime["AWS_ACCESS_KEY_ID"],
             "aws_secret_access_key": runtime["AWS_SECRET_ACCESS_KEY"],
             "aws_region": runtime.get("AWS_REGION", "us-east-1"),
             "aws_bucket_name": runtime["AWS_BUCKET_NAME"],
         }
+        modo_analise = ler_bool_config(runtime.get("MODO_ANALISE"), False)
 
         if modo_analise:
             resultado = analisar_documento_api(

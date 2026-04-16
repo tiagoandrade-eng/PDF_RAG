@@ -7,7 +7,7 @@ import re
 import psycopg
 from psycopg import sql
 
-from .config import VECTOR_DIM
+from .constants import VECTOR_DIM
 
 
 logger = logging.getLogger(__name__)
