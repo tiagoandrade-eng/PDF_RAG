@@ -1,6 +1,5 @@
 # Secrets
 .env
-app_settings.env
 
 # Python
 __pycache__/

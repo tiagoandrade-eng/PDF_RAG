@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from .constants import (
     DEFAULT_SCHEMA,
@@ -22,6 +23,8 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
+StrObrigatoria = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -29,12 +32,12 @@ logger = logging.getLogger(__name__)
 class Config(BaseModel):
     model_config = {"frozen": True}
 
-    openai_api_key: str
-    rds_db_url: str
-    aws_access_key_id: str
-    aws_secret_access_key: str
-    aws_region: str
-    aws_bucket_name: str
+    openai_api_key: StrObrigatoria
+    rds_db_url: StrObrigatoria
+    aws_access_key_id: StrObrigatoria
+    aws_secret_access_key: StrObrigatoria
+    aws_region: StrObrigatoria
+    aws_bucket_name: StrObrigatoria
     db_schema: str = Field(default=DEFAULT_SCHEMA)
     processar_imagens: bool = Field(default=True)
     page_batch_size: int = Field(default=PAGE_BATCH_SIZE, gt=0)
@@ -85,23 +88,6 @@ def carregar_config_execucao() -> dict[str, str]:
     config.update(os.environ)
     return config
 
-
-def ler_bool_config(valor: str | None, default: bool) -> bool:
-    if valor is None or not valor.strip():
-        return default
-    return valor.strip().lower() in {"1", "true", "t", "yes", "y", "sim", "s", "on"}
-
-
-def ler_int_config(valor: str | None, default: int) -> int:
-    if valor is None or not valor.strip():
-        return default
-    return int(valor)
-
-
-def ler_float_config(valor: str | None, default: float) -> float:
-    if valor is None or not valor.strip():
-        return default
-    return float(valor)
 
 
 # ---------------------------------------------------------------------------
