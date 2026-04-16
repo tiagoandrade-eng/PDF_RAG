@@ -9,66 +9,68 @@ Pipeline de ingestao RAG para PDFs com suporte a:
 - embeddings com OpenAI
 - persistencia em PostgreSQL com pgvector
 
-## Estrutura
+## Estrutura (MVC)
 
-- `pdf_rag/`: pacote principal do projeto
-- `pdf_rag/config.py`: configuracao e leitura dos arquivos `.env`
-- `pdf_rag/database.py`: acesso ao PostgreSQL/pgvector
-- `pdf_rag/embeddings.py`: embeddings e truncamento de texto
-- `pdf_rag/images.py`: normalizacao de imagem e OCR
-- `pdf_rag/text_pipeline.py`: funcoes puras de texto e metadata
-- `pdf_rag/ocr_service.py`: execucao concorrente do EasyOCR
-- `pdf_rag/image_pipeline.py`: serializacao e pipeline de imagens
-- `pdf_rag/analysis_service.py`: modo analise e estimativas de custo
-- `pdf_rag/vision.py`: descricao de imagens com Vision
-- `pdf_rag/processor.py`: orquestracao principal, agora mais fina
-- `pdf_rag/cli.py`: entrypoints da aplicacao
-- `pdf_rag/pipeline.py`: compatibilidade para imports antigos
-- `pdf_rag/__main__.py`: entrypoint para `python -m pdf_rag`
-- `run_pdf_rag.py`: launcher simples para execucao local
-- `.env`: credenciais e configuracoes sensiveis
-- `app_settings.env`: configuracoes funcionais do app
-- `.env.example` e `app_settings.env.example`: modelos de configuracao
-- `requirements.txt`: dependencias para instalacao rapida
-- `docs/COMO_RODAR.md`: passo a passo operacional
+```
+pdf_rag/
+  models/
+    constants.py       todas as constantes e parametros
+    config.py          Config (Pydantic), TokenCounter, leitura .env
+    database.py        PostgreSQL/pgvector
+  controllers/
+    images.py          extracao, OCR, Vision, pipeline de imagem
+    processor.py       embeddings, texto, analise, orquestracao
+  views/
+    api.py             API FastAPI (/processar, /analisar, /health)
+  __init__.py
+  __main__.py
+run_api.py             launcher da API
+```
 
-## Execucao rapida
+## Executar
 
 ```powershell
 pip install -r requirements.txt
-python .\run_pdf_rag.py
+python run_api.py
 ```
 
-## Instalacao como projeto
+Acesse http://localhost:8000/docs para o Swagger UI.
 
-```powershell
-pip install -e .
-pdf-rag
+## Endpoints
+
+| Metodo | Rota | Descricao |
+|--------|------|-----------|
+| GET | /health | Health check |
+| POST | /processar | Processa PDF completo (OCR + Vision + banco) |
+| POST | /analisar | Analise previa sem gastar tokens |
+
+Exemplo:
+
+```json
+POST /processar
+{
+  "s3_pdf_key": "suporte/manual.pdf",
+  "tabela": "minha_tabela_rag",
+  "db_schema": "public"
+}
 ```
 
-## Execucao alternativa
-
-```powershell
-python -m pdf_rag
+```json
+POST /analisar
+{
+  "s3_pdf_key": "suporte/manual.pdf"
+}
 ```
 
-## Analise antes de gastar token
+## Configuracao
 
-Voce pode ativar `MODO_ANALISE=true` para rodar um pre-flight do PDF.
-Nesse modo o pipeline estima:
+Preencha o `.env` com as credenciais (use `.env.example` como modelo):
 
-- quantas imagens foram descartadas pelos filtros
-- quantas seguiram para OCR
-- quantas ainda precisariam de Vision
+- `RDS_DB_URL`
+- `OPENAI_API_KEY`
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_REGION`
+- `AWS_BUCKET_NAME`
 
-sem chamar OpenAI e sem gravar nada no banco.
-O resumo tambem sai em JSON no terminal, e `RDS_DB_URL` / `OPENAI_API_KEY` podem ficar vazios nessa execucao.
-
-## Boas praticas aplicadas
-
-- configuracao separada entre segredos e parametros do app
-- modulo Python com nome valido e ponto de entrada explicito
-- separacao por responsabilidade em modulos menores
-- launcher dedicado para uso local
-- arquivos example para onboarding
-- metadados de projeto em `pyproject.toml`
+Os parametros de execucao estao em `models/constants.py`.

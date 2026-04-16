@@ -82,7 +82,6 @@ def carregar_arquivo_env(nome_arquivo: str) -> dict[str, str]:
 def carregar_config_execucao() -> dict[str, str]:
     config: dict[str, str] = {}
     config.update(carregar_arquivo_env(".env"))
-    config.update(carregar_arquivo_env("app_settings.env"))
     config.update(os.environ)
     return config
 

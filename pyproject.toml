@@ -11,16 +11,16 @@ requires-python = ">=3.10"
 dependencies = [
     "boto3",
     "easyocr",
+    "fastapi",
     "httpx",
     "numpy",
     "openai",
     "Pillow",
     "psycopg[binary]",
+    "pydantic",
     "PyMuPDF",
+    "uvicorn",
 ]
 
-[project.scripts]
-pdf-rag = "pdf_rag:main"
-
 [tool.setuptools.packages.find]
-include = ["pdf_rag"]
+include = ["pdf_rag", "pdf_rag.*"]

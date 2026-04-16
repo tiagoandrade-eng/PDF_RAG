@@ -2,20 +2,7 @@
 Pacote principal do projeto PDF RAG.
 """
 
-from .views.cli import (
-    analisar_documento_api,
-    analisar_documento_async,
-    main,
-    processar_documento_api,
-    processar_documento_async,
-)
 from .models.config import Config
+from .views.api import app
 
-__all__ = [
-    "Config",
-    "main",
-    "analisar_documento_api",
-    "analisar_documento_async",
-    "processar_documento_api",
-    "processar_documento_async",
-]
+__all__ = ["Config", "app"]
