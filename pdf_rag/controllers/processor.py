@@ -5,10 +5,12 @@ import logging
 import os
 import tempfile
 from collections import Counter
+from dataclasses import dataclass
 
 import boto3
 import fitz
 from openai import AsyncOpenAI
+import psycopg
 
 from ..models.config import Config, TokenCounter, truncar
 from ..models.constants import (
@@ -18,7 +20,7 @@ from ..models.constants import (
     MODEL_MINI,
     TAMANHO_QUEBRA_SIZES,
 )
-from ..models.database import DatabaseManager
+from ..models.database import DatabaseManager, InsertResult
 from .images import (
     ImageContentPipeline,
     ImageSerializer,
@@ -29,6 +31,33 @@ from .images import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class ConnectivityError(RuntimeError):
+    def __init__(self, errors: dict[str, str]) -> None:
+        self.errors = errors
+        detalhes = "; ".join(f"{servico}: {erro}" for servico, erro in errors.items())
+        super().__init__(f"Falha no preflight de conexoes: {detalhes}")
+
+
+@dataclass
+class FlushResult:
+    attempted: int = 0
+    inserted: int = 0
+    failed: int = 0
+
+    def merge(self, other: "FlushResult") -> None:
+        self.attempted += other.attempted
+        self.inserted += other.inserted
+        self.failed += other.failed
+
+    @classmethod
+    def from_insert_result(cls, insert_result: InsertResult) -> "FlushResult":
+        return cls(
+            attempted=insert_result.attempted,
+            inserted=insert_result.inserted,
+            failed=insert_result.failed,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +249,31 @@ class PDFProcessor:
             region_name=cfg.aws_region,
         )
 
+    async def validar_conexoes(self, checar_db: bool = True, checar_openai: bool = True) -> dict[str, str]:
+        nomes = ["s3"]
+        corrotinas = [self._testar_s3()]
+        if checar_db:
+            nomes.append("rds")
+            corrotinas.append(self._testar_rds())
+        if checar_openai:
+            nomes.append("openai")
+            corrotinas.append(self._testar_openai())
+
+        resultados = await asyncio.gather(*corrotinas, return_exceptions=True)
+        errors: dict[str, str] = {}
+        status: dict[str, str] = {}
+        for nome, resultado in zip(nomes, resultados):
+            if isinstance(resultado, Exception):
+                errors[nome] = f"{type(resultado).__name__}: {resultado}"
+            else:
+                status[nome] = "ok"
+
+        if errors:
+            raise ConnectivityError(errors)
+
+        logger.info("Preflight de conexoes ok: %s", ", ".join(nomes))
+        return status
+
     async def processar(self, s3_key: str, tabela: str) -> dict:
         self._inicializar_clientes_processamento()
         db, _, vision = self._require_processing_clients()
@@ -258,6 +312,20 @@ class PDFProcessor:
     def _resetar_estado_documento(self) -> None:
         self._xrefs_vistos = set()
 
+    async def _testar_s3(self) -> None:
+        await asyncio.to_thread(self.s3.head_bucket, Bucket=self.cfg.aws_bucket_name)
+
+    async def _testar_rds(self) -> None:
+        await asyncio.to_thread(self._testar_rds_sync)
+
+    def _testar_rds_sync(self) -> None:
+        with psycopg.connect(self.cfg.rds_db_url) as conn:
+            conn.execute("SELECT 1;").fetchone()
+
+    async def _testar_openai(self) -> None:
+        client = AsyncOpenAI(api_key=self.cfg.openai_api_key)
+        await client.models.list()
+
     async def _baixar_pdf_temporario(self, s3_key: str, analise: bool = False) -> str:
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
         os.close(tmp_fd)
@@ -293,6 +361,7 @@ class PDFProcessor:
             chunks_texto = 0
             chunks_img = 0
             chunks_pulados = 0
+            persistencia = FlushResult()
             batch_texts: list[str] = []
             batch_metas: list[dict] = []
 
@@ -316,7 +385,9 @@ class PDFProcessor:
                         batch_texts.append(chunk)
                         batch_metas.append(meta)
                         if len(batch_texts) >= BATCH_SIZES[0]:
-                            chunks_texto += await self._flush(tabela, batch_texts, batch_metas)
+                            flush_result = await self._flush(tabela, batch_texts, batch_metas)
+                            chunks_texto += flush_result.inserted
+                            persistencia.merge(flush_result)
                             batch_texts, batch_metas = [], []
 
                     if self.cfg.processar_imagens:
@@ -326,10 +397,21 @@ class PDFProcessor:
                     payloads = image_serializer.serializar_paginas(paginas_img, ja_processados)
                     textos_img, metas_img = await image_pipeline.extrair_conteudo(payloads, s3_key)
                     if textos_img:
-                        chunks_img += await self._flush(tabela, textos_img, metas_img)
+                        flush_result = await self._flush(tabela, textos_img, metas_img)
+                        chunks_img += flush_result.inserted
+                        persistencia.merge(flush_result)
 
             if batch_texts:
-                chunks_texto += await self._flush(tabela, batch_texts, batch_metas)
+                flush_result = await self._flush(tabela, batch_texts, batch_metas)
+                chunks_texto += flush_result.inserted
+                persistencia.merge(flush_result)
+
+            if persistencia.failed > 0:
+                raise RuntimeError(
+                    "Falha de persistencia no banco: "
+                    f"{persistencia.failed}/{persistencia.attempted} registro(s) falharam "
+                    f"(inseridos={persistencia.inserted})."
+                )
 
             tokens_resumo = {
                 modelo: {"input_tokens": contagem["input"], "output_tokens": contagem["output"]}
@@ -342,6 +424,11 @@ class PDFProcessor:
                 "chunks_texto": chunks_texto,
                 "chunks_imagem": chunks_img,
                 "chunks_pulados": chunks_pulados,
+                "persistencia": {
+                    "attempted": persistencia.attempted,
+                    "inserted": persistencia.inserted,
+                    "failed": persistencia.failed,
+                },
                 "openai_tokens": tokens_resumo,
                 "openai_custo_usd": round(self.counter.custo_usd(), 6),
             }
@@ -355,9 +442,9 @@ class PDFProcessor:
         finally:
             doc.close()
 
-    async def _flush(self, tabela: str, texts: list[str], metas: list[dict]) -> int:
+    async def _flush(self, tabela: str, texts: list[str], metas: list[dict]) -> FlushResult:
         if not texts:
-            return 0
+            return FlushResult()
         for batch_size in BATCH_SIZES:
             try:
                 return await self._flush_em_blocos(tabela, texts, metas, batch_size)
@@ -367,9 +454,9 @@ class PDFProcessor:
 
     async def _flush_em_blocos(
         self, tabela: str, texts: list[str], metas: list[dict], batch_size: int,
-    ) -> int:
+    ) -> FlushResult:
         db, embedder, _ = self._require_processing_clients()
-        total = 0
+        total = FlushResult()
         for index in range(0, len(texts), batch_size):
             bloco_t = [truncar(texto) for texto in texts[index : index + batch_size]]
             bloco_m = metas[index : index + batch_size]
@@ -378,20 +465,22 @@ class PDFProcessor:
                 {"text": bloco_t[i], "metadata": bloco_m[i], "embedding": vetores[i]}
                 for i in range(len(bloco_t))
             ]
-            total += await asyncio.to_thread(db.insert_records, tabela, records)
+            insert_result = await asyncio.to_thread(db.insert_records, tabela, records)
+            total.merge(FlushResult.from_insert_result(insert_result))
         return total
 
-    async def _flush_com_quebra(self, tabela: str, texts: list[str], metas: list[dict]) -> int:
+    async def _flush_com_quebra(self, tabela: str, texts: list[str], metas: list[dict]) -> FlushResult:
         db, embedder, _ = self._require_processing_clients()
-        total = 0
+        total = FlushResult()
         for texto, meta in zip(texts, metas):
             texto = truncar(texto)
             try:
                 vetores = await embedder.embed([texto])
-                total += await asyncio.to_thread(
+                insert_result = await asyncio.to_thread(
                     db.insert_records, tabela,
                     [{"text": texto, "metadata": meta, "embedding": vetores[0]}],
                 )
+                total.merge(FlushResult.from_insert_result(insert_result))
             except Exception as exc:
                 logger.warning("Embedding falhou pag %s: %s. Quebrando...", meta["pagina"], exc)
                 for tam in TAMANHO_QUEBRA_SIZES:
@@ -417,8 +506,11 @@ class PDFProcessor:
                             break
                     if not falhou:
                         for record in salvos:
-                            total += await asyncio.to_thread(db.insert_records, tabela, [record])
+                            insert_result = await asyncio.to_thread(db.insert_records, tabela, [record])
+                            total.merge(FlushResult.from_insert_result(insert_result))
                         break
                 else:
                     logger.error("Falha total pag %s. Pulando.", meta["pagina"])
+                    total.attempted += 1
+                    total.failed += 1
         return total

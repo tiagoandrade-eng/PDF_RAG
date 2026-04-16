@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 import psycopg
 from psycopg import sql
@@ -11,6 +12,22 @@ from .constants import VECTOR_DIM
 
 
 logger = logging.getLogger(__name__)
+
+
+class DatabaseReadError(RuntimeError):
+    pass
+
+
+@dataclass
+class InsertResult:
+    attempted: int = 0
+    inserted: int = 0
+    failed: int = 0
+
+    def merge(self, other: "InsertResult") -> None:
+        self.attempted += other.attempted
+        self.inserted += other.inserted
+        self.failed += other.failed
 
 
 def normalizar_nome_tabela(nome: str) -> str:
@@ -97,11 +114,14 @@ class DatabaseManager:
 
             logger.info("%s chunks ja existentes para '%s'.", len(processados), arquivo)
         except Exception as exc:
-            logger.warning("Falha ao buscar processados: %s. Reprocessando tudo.", exc)
+            logger.error("Falha ao buscar chunks processados para '%s': %s", arquivo, exc)
+            raise DatabaseReadError(
+                f"Nao foi possivel consultar chunks ja processados para '{arquivo}'."
+            ) from exc
 
         return processados
 
-    def insert_records(self, tabela: str, records: list[dict]) -> int:
+    def insert_records(self, tabela: str, records: list[dict]) -> InsertResult:
         """
         Upsert com SAVEPOINT por registro via conn.transaction().
         Um erro num registro nunca reverte os demais ja inseridos.
@@ -122,7 +142,7 @@ class DatabaseManager:
             """
         ).format(schema=sql.Identifier(self.schema), table=sql.Identifier(tbl))
 
-        total = 0
+        resultado = InsertResult(attempted=len(records))
         with psycopg.connect(self.db_url) as conn:
             for rec in records:
                 try:
@@ -135,13 +155,12 @@ class DatabaseManager:
                                 rec["embedding"],
                             ),
                         )
-                    total += 1
-                except psycopg.errors.UniqueViolation:
-                    pass
+                    resultado.inserted += 1
                 except Exception as exc:
+                    resultado.failed += 1
                     logger.error(
                         "Erro ao inserir registro (pag %s): %s",
                         rec["metadata"].get("pagina"),
                         exc,
                     )
-        return total
+        return resultado
